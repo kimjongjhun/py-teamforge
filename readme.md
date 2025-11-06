@@ -28,14 +28,16 @@ The system is designed for real-world use cases where strict constraints must be
 
 ```
 .
+├── balancer/
+│   └── team_balancer.py
+├── data/
+│   └── players.csv
+│   └── teams.json
 ├── models/
 │   └── player.py
-├── services/
-│   └── team_balancer.py
-├── input/
-│   └── players.csv
-├── output/
-│   └── results.json
+├── utils/
+│   └── csv_handler.py
+│   └── json_handler.py
 ├── main.py
 └── README.md
 ```
@@ -61,7 +63,7 @@ pip install -r requirements.txt
 
 ## Input Format
 
-Place a file named `players.csv` in the `input/` directory.
+Place a file named `players.csv` in the `data/` directory.
 
 ### Columns
 
@@ -102,7 +104,7 @@ The system will:
 2. Attempt valid team layouts.
 3. Test spreads: 0, 10, 20, 30, 40, 50.
 4. Stop at the first spread that yields valid teams.
-5. Output results to `output/results.json`.
+5. Output results to `data/teams.json`.
 
 ---
 

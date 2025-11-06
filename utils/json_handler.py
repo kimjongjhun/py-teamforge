@@ -32,5 +32,5 @@ def write_teams_to_json(teams: List[List[Player]], filename: str, spread_used: f
 
         output["teams"].append(team_entry)
 
-    with open(filename, "w") as f:
-        json.dump(output, f, indent=4)
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)

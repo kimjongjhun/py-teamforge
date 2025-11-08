@@ -16,17 +16,17 @@ LOG_FILE = os.path.join(LOG_DIR, "teamforge.log")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 logger = logging.getLogger("team_balancer")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 # Console handler (info-level by default, debug will also go through depending on formatter)
 ch = logging.StreamHandler()
-ch.setLevel(logging.DEBUG)
+ch.setLevel(logging.INFO)
 ch_formatter = logging.Formatter("[%(levelname)s] %(message)s")
 ch.setFormatter(ch_formatter)
 
 # File handler (debug-level)
 fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-fh.setLevel(logging.DEBUG)
+fh.setLevel(logging.INFO)
 fh_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 fh.setFormatter(fh_formatter)
 

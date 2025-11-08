@@ -28,6 +28,12 @@ def main():
             f"Team {i}: {len(team)} players | Total={total:.2f} | Avg={avg:.2f} | Groups={groups}"
         )
 
+    for i, team in enumerate(teams, 1):
+        names = [p.name for p in team]
+        print(
+            f"Team {i}: {names}"
+        )
+
     write_teams_to_json(teams, output_json, spread_used)
     print(f"\nTeams written to {output_json}")
 

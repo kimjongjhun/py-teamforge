@@ -379,40 +379,42 @@ def balance_teams(players: List[Player], max_search_spread: int = 50) -> Dict:
         logger.error("No valid team-size layouts for %d players.", n)
         return {"spread_used": None, "teams": [], "group_mode": "NONE"}
 
+    spread_tiers = list(range(0, max_search_spread + 1, 10))
+
     # Phase order: strict first (max 1 per group), then relaxed (max 2 per group)
     for mode, max_group_per_team in [("STRICT", 1), ("RELAXED", 2)]:
         logger.info("=== Starting mode: %s (max_group_per_team=%d) ===", mode, max_group_per_team)
-        for spread_limit in range(0, max_search_spread + 1, 10):
-            logger.info("[%s][SPREAD=%d] Attempting layouts...", mode, spread_limit)
-            best_for_this_spread = None
-            best_spread_seen = math.inf
+        best_teams = None
+        best_spread = math.inf
 
-            for layout in layouts:
-                logger.debug("[%s][SPREAD=%d] Trying layout sizes %s", mode, spread_limit, layout)
-                assigned = try_assign_with_timeout(
-                    players, layout, max_group_per_team=max_group_per_team, timeout_seconds=10.0
-                )
-                if not assigned:
-                    logger.debug("[%s][SPREAD=%d] Assignment failed or timed out for layout %s", mode, spread_limit, layout)
-                    continue
+        for layout in layouts:
+            logger.debug("[%s] Trying layout sizes %s", mode, layout)
+            assigned = try_assign_with_timeout(
+                players, layout, max_group_per_team=max_group_per_team, timeout_seconds=10.0
+            )
+            if not assigned:
+                logger.debug("[%s] Assignment failed or timed out for layout %s", mode, layout)
+                continue
 
-                optimized = optimize_balance_with_timeout(assigned, timeout_seconds=10.0)
-                spread = evaluate_spread(optimized)
-                logger.debug("[%s][SPREAD=%d] Layout %s produced spread=%.2f after optimization", mode, spread_limit, layout, spread)
+            optimized = optimize_balance_with_timeout(assigned, timeout_seconds=10.0)
+            spread = evaluate_spread(optimized)
+            logger.debug("[%s] Layout %s produced spread=%.2f after optimization", mode, layout, spread)
 
-                if spread <= spread_limit:
-                    logger.info("[%s][SPREAD=%d] Success with layout %s (spread=%.2f)", mode, spread_limit, layout, spread)
-                    return {"spread_used": spread, "teams": optimized, "group_mode": mode}
+            if spread < best_spread:
+                best_spread = spread
+                best_teams = optimized
 
-                # track best anyway
-                if spread < best_spread_seen:
-                    best_spread_seen = spread
-                    best_for_this_spread = optimized
+        spread_limit = next((s for s in spread_tiers if s >= best_spread), None)
+        if spread_limit is not None:
+            logger.info("[%s][SPREAD=%d] Success (spread=%.2f)", mode, spread_limit, best_spread)
+            return {"spread_used": best_spread, "teams": best_teams, "group_mode": mode}
 
-            logger.info("[%s] No layout succeeded at spread=%d. Best spread seen this pass=%.2f", mode, spread_limit, best_spread_seen)
-
-        # if we reach here, strict/relaxed mode exhausted spreads up to max_search_spread
-        logger.info("[%s] Exhausted spreads up to %d without success. Switching mode if available.", mode, max_search_spread)
+        logger.info(
+            "[%s] No layout within spread=%d. Best spread seen=%.2f. Switching mode if available.",
+            mode,
+            max_search_spread,
+            best_spread,
+        )
 
     # Final best-effort pass: pick the best spread we could find under time-limited attempts
     logger.info("Attempting final best-effort search (time-limited) across layouts.")

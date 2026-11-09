@@ -361,32 +361,46 @@ def optimize_balance_with_timeout(teams: List[List[Player]], timeout_seconds: fl
 
 
 # ---------------------------
-# Exact search: CP-SAT model that minimizes spread under the same constraints
-# (friend blocks together, family separation, per-team group limit, exact layout sizes).
+# Exact search: CP-SAT model that minimizes spread, then group overlaps, under the hard constraints
+# (friend blocks together, family separation, exact layout sizes).
 # Averages are scaled to integers at 0.01 precision.
 # ---------------------------
 SPREAD_SCALE = 100
 
 
+def count_group_overlaps(teams: List[List[Player]]) -> int:
+    """Number of players sharing a group_code with an earlier teammate (0 = every team has distinct groups)."""
+    overlaps = 0
+    for team in teams:
+        counts: Dict[str, int] = defaultdict(int)
+        for p in team:
+            if p.group_code:
+                counts[p.group_code] += 1
+        overlaps += sum(c - 1 for c in counts.values() if c > 1)
+    return overlaps
+
+
 def solve_min_spread(
     players: List[Player],
     sizes: List[int],
-    max_group_per_team: int = 1,
     spread_limit: Optional[float] = None,
     timeout_seconds: float = 10.0,
-) -> Tuple[List[List[Player]], float, bool]:
+    max_group_per_team: Optional[int] = None,
+) -> Tuple[List[List[Player]], float, int, bool]:
     """
-    Find the minimum-spread assignment for a layout, optionally restricted to spread <= spread_limit.
+    Find the minimum-spread assignment for a layout (optionally restricted to spread <= spread_limit),
+    then, among assignments with that spread, the one with the fewest group overlaps.
 
-    Returns (teams, spread, proven):
-        teams  -- best assignment found ([] if none)
-        spread -- evaluate_spread(teams), or math.inf if none
-        proven -- True if the search was exhausted (teams is optimal, or no assignment exists)
+    Returns (teams, spread, overlaps, proven):
+        teams    -- best assignment found ([] if none)
+        spread   -- evaluate_spread(teams), or math.inf if none
+        overlaps -- count_group_overlaps(teams)
+        proven   -- True if the search was exhausted (teams is optimal, or no assignment exists)
     """
     k = len(sizes)
     blocks = build_blocks(players, max(sizes))
     if any(len(b) > max(sizes) for b in blocks):
-        return [], math.inf, True
+        return [], math.inf, 0, True
 
     model = cp_model.CpModel()
     x = [[model.NewBoolVar(f"b{b}_t{t}") for t in range(k)] for b in range(len(blocks))]
@@ -396,7 +410,7 @@ def solve_min_spread(
     for t in range(k):
         model.Add(sum(len(blocks[b]) * x[b][t] for b in range(len(blocks))) == sizes[t])
 
-    # Family limit is per block (as in violates_family); group limit counts every player.
+    # Family limit is per block (as in violates_family); group counts every player.
     family_blocks: Dict[str, set] = defaultdict(set)
     group_blocks: Dict[str, List[int]] = defaultdict(list)
     for b, block in enumerate(blocks):
@@ -405,11 +419,18 @@ def solve_min_spread(
                 family_blocks[p.family_code].add(b)
             if p.group_code:
                 group_blocks[p.group_code].append(b)
+
+    overlap_vars = []
     for t in range(k):
         for bs in family_blocks.values():
             model.Add(sum(x[b][t] for b in bs) <= 1)
-        for bs in group_blocks.values():
-            model.Add(sum(x[b][t] for b in bs) <= max_group_per_team)
+        for g, bs in group_blocks.items():
+            count = sum(x[b][t] for b in bs)
+            if max_group_per_team is not None:
+                model.Add(count <= max_group_per_team)
+            overlap = model.NewIntVar(0, len(bs), f"overlap_{g}_t{t}")
+            model.Add(overlap >= count - 1)
+            overlap_vars.append(overlap)
 
     block_scores = [round(sum(p.average for p in block) * SPREAD_SCALE) for block in blocks]
     max_total = sum(abs(v) for v in block_scores)
@@ -430,102 +451,107 @@ def solve_min_spread(
     model.AddMinEquality(lo, totals)
     if spread_limit is not None:
         model.Add(hi - lo <= round(spread_limit * SPREAD_SCALE))
-    model.Minimize(hi - lo)
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = timeout_seconds
     solver.parameters.num_workers = 1
-    status = solver.Solve(model)
-    proven = status in (cp_model.OPTIMAL, cp_model.INFEASIBLE)
-    logger.debug(
-        "CP-SAT layout=%s max_group=%d limit=%s -> %s (%.2fs)",
-        sizes, max_group_per_team, spread_limit, solver.StatusName(status), solver.WallTime(),
-    )
 
+    # Stage 1: lowest spread.
+    model.Minimize(hi - lo)
+    status = solver.Solve(model)
+    logger.debug("CP-SAT layout=%s limit=%s spread stage -> %s (%.2fs)", sizes, spread_limit, solver.StatusName(status), solver.WallTime())
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return [], math.inf, proven
+        return [], math.inf, 0, status == cp_model.INFEASIBLE
+    proven = status == cp_model.OPTIMAL
+
+    # Stage 2: fewest group overlaps at that spread.
+    model.Add(hi - lo <= solver.Value(hi - lo))
+    for row in x:
+        for var in row:
+            model.AddHint(var, solver.Value(var))
+    model.Minimize(sum(overlap_vars))
+    status = solver.Solve(model)
+    logger.debug("CP-SAT layout=%s limit=%s overlap stage -> %s (%.2fs)", sizes, spread_limit, solver.StatusName(status), solver.WallTime())
+    proven = proven and status == cp_model.OPTIMAL
 
     teams = [
         [p for b in range(len(blocks)) if solver.Value(x[b][t]) for p in blocks[b]]
         for t in range(k)
     ]
-    return teams, evaluate_spread(teams), proven
+    return teams, evaluate_spread(teams), count_group_overlaps(teams), proven
 
 
 # ---------------------------
-# Master: spread tiers (lowest first, each exhausted before the next), strict -> relaxed
+# Master: spread tiers (lowest first, each exhausted before the next).
+# Lower spread always wins; group overlaps are only minimized among equal-spread arrangements.
 # ---------------------------
 def balance_teams(players: List[Player], max_search_spread: int = 50, solver_timeout_seconds: float = 10.0) -> Dict:
     """
     Attempts to create the most balanced teams possible.
 
-    For each mode (STRICT, then RELAXED) and each spread tier (0, 10, ..., max_search_spread),
-    every layout is searched exhaustively for the lowest spread within the tier. A higher tier is
-    only tried once the lower tier is proven impossible.
+    For each spread tier (0, 10, ..., max_search_spread), every layout is searched exhaustively for the
+    lowest spread within the tier, then the fewest group overlaps at that spread. A higher tier is only
+    tried once the lower tier is proven impossible. Family separation, friend blocks and team sizes are
+    hard constraints; group separation is not.
 
     Returns:
         {
             "spread_used": float | None,
             "teams": List[List[Player]] | [],
-            "group_mode": "STRICT" | "RELAXED"
+            "group_mode": "STRICT" (no group overlaps) | "RELAXED" | "NONE",
+            "group_overlaps": int | None
         }
     """
     n = len(players)
     layouts = compute_team_sizes(n)
     if not layouts:
         logger.error("No valid team-size layouts for %d players.", n)
-        return {"spread_used": None, "teams": [], "group_mode": "NONE"}
+        return {"spread_used": None, "teams": [], "group_mode": "NONE", "group_overlaps": None}
 
-    for mode, max_group_per_team in [("STRICT", 1), ("RELAXED", 2)]:
-        logger.info("=== Starting mode: %s (max_group_per_team=%d) ===", mode, max_group_per_team)
-        for spread_limit in range(0, max_search_spread + 1, 10):
-            best_teams = None
-            best_spread = math.inf
-            exhausted = True
+    def result(teams: List[List[Player]], spread: float, overlaps: int) -> Dict:
+        mode = "STRICT" if overlaps == 0 else "RELAXED"
+        return {"spread_used": spread, "teams": teams, "group_mode": mode, "group_overlaps": overlaps}
 
-            for layout in layouts:
-                teams, spread, proven = solve_min_spread(
-                    players, layout, max_group_per_team, spread_limit, solver_timeout_seconds
-                )
-                exhausted = exhausted and proven
-                logger.debug("[%s][SPREAD=%d] Layout %s -> spread=%.2f (proven=%s)", mode, spread_limit, layout, spread, proven)
-                if teams and spread < best_spread:
-                    best_spread = spread
-                    best_teams = teams
+    def search(spread_limit: Optional[float]) -> Tuple[Optional[List[List[Player]]], float, int, bool]:
+        best = (None, math.inf, 0)
+        exhausted = True
+        for layout in layouts:
+            teams, spread, overlaps, proven = solve_min_spread(players, layout, spread_limit, solver_timeout_seconds)
+            exhausted = exhausted and proven
+            logger.debug("[SPREAD=%s] Layout %s -> spread=%.2f overlaps=%d (proven=%s)", spread_limit, layout, spread, overlaps, proven)
+            if teams and (spread, overlaps) < best[1:]:
+                best = (teams, spread, overlaps)
+        return best[0], best[1], best[2], exhausted
 
-            if best_teams is not None:
-                if exhausted:
-                    logger.info("[%s][SPREAD=%d] Success (spread=%.2f, proven minimum)", mode, spread_limit, best_spread)
-                else:
-                    logger.warning("[%s][SPREAD=%d] Success (spread=%.2f, solver timed out before proving minimum)", mode, spread_limit, best_spread)
-                return {"spread_used": best_spread, "teams": best_teams, "group_mode": mode}
-
+    for spread_limit in range(0, max_search_spread + 1, 10):
+        teams, spread, overlaps, exhausted = search(spread_limit)
+        if teams is not None:
             if exhausted:
-                logger.info("[%s][SPREAD=%d] No arrangement possible (all options exhausted)", mode, spread_limit)
+                logger.info("[SPREAD=%d] Success (spread=%.2f, group overlaps=%d, proven minimum)", spread_limit, spread, overlaps)
             else:
-                logger.warning("[%s][SPREAD=%d] Solver timed out before exhausting this tier; moving on", mode, spread_limit)
+                logger.warning("[SPREAD=%d] Success (spread=%.2f, group overlaps=%d, solver timed out before proving minimum)", spread_limit, spread, overlaps)
+            return result(teams, spread, overlaps)
 
-        logger.info("[%s] No arrangement within spread=%d. Switching mode if available.", mode, max_search_spread)
+        if exhausted:
+            logger.info("[SPREAD=%d] No arrangement possible (all options exhausted)", spread_limit)
+        else:
+            logger.warning("[SPREAD=%d] Solver timed out before exhausting this tier; moving on", spread_limit)
 
-    # Best-effort: lowest spread with no limit (relaxed), heuristic if the solver finds nothing in time
-    logger.info("Attempting final best-effort search across layouts.")
-    best_overall = None
-    best_overall_spread = math.inf
-    for layout in layouts:
-        teams, spread, _ = solve_min_spread(players, layout, 2, None, solver_timeout_seconds)
-        if not teams:
+    # Best-effort: lowest spread with no limit, heuristic if the solver finds nothing in time
+    logger.info("No arrangement within spread=%d. Attempting final best-effort search across layouts.", max_search_spread)
+    teams, spread, overlaps, _ = search(None)
+    if teams is None:
+        for layout in layouts:
             assigned = try_assign_with_timeout(players, layout, max_group_per_team=2, timeout_seconds=5.0)
             if not assigned:
                 continue
-            teams = optimize_balance_with_timeout(assigned, timeout_seconds=5.0)
-            spread = evaluate_spread(teams)
-        if spread < best_overall_spread:
-            best_overall_spread = spread
-            best_overall = teams
+            optimized = optimize_balance_with_timeout(assigned, timeout_seconds=5.0)
+            if evaluate_spread(optimized) < spread:
+                teams, spread, overlaps = optimized, evaluate_spread(optimized), count_group_overlaps(optimized)
 
-    if best_overall is not None:
-        logger.warning("No arrangement met strict/relaxed limits; returning best-effort with spread=%.2f", best_overall_spread)
-        return {"spread_used": best_overall_spread, "teams": best_overall, "group_mode": "RELAXED"}
+    if teams is not None:
+        logger.warning("No arrangement met spread<=%d; returning best-effort with spread=%.2f", max_search_spread, spread)
+        return result(teams, spread, overlaps)
 
     logger.error("No arrangement found (even best-effort failed).")
-    return {"spread_used": None, "teams": [], "group_mode": "NONE"}
+    return {"spread_used": None, "teams": [], "group_mode": "NONE", "group_overlaps": None}

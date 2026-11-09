@@ -14,8 +14,8 @@ The system is designed for real-world use cases where strict constraints must be
   - Up to two teams of **3** with the rest **4**
 - Keeps friend groups together, splitting only when necessary.
 - Ensures family members are never placed on the same team.
-- Distributes church groups across teams (groups must be split).
-- Searches for the most balanced result by checking spreads from 0 → 50 in increments of 10. Each tier is searched exhaustively (OR-Tools CP-SAT) and proven impossible before the next tier is tried, and the lowest spread within the first feasible tier is returned.
+- Distributes church groups across teams, but never at the cost of a higher spread: among arrangements with the lowest spread, the one with the fewest same-group teammates is chosen.
+- Searches for the most balanced result by checking spreads from 0 → 50 in increments of 10. Each tier is searched exhaustively (OR-Tools CP-SAT) and proven impossible before the next tier is tried, and the lowest spread within the first feasible tier is returned (fewest group overlaps as the tiebreaker).
 - Produces a clean JSON output with:
   - Final spread used
   - All team rosters
@@ -180,11 +180,11 @@ The system will:
 
 - Friend groups stay together if possible.
 - Family members are split into separate teams.
-- Church groups are distributed to maximize diversity.
+- Church groups are distributed to minimize same-group teammates, as a tiebreaker after spread.
 - Team sizes respect allowed patterns.
 - Average sums must fall within the allowed spread.
 
-If a perfect spread is impossible, the solver gradually relaxes constraints.
+Team sizes, friend groups and family separation are hard constraints; church-group separation is a soft preference.
 
 ---
 
@@ -193,9 +193,8 @@ If a perfect spread is impossible, the solver gradually relaxes constraints.
 During execution, you will see:
 
 ```
-[STRICT][SPREAD=0] No arrangement possible (all options exhausted)
-[RELAXED][SPREAD=0] No arrangement possible (all options exhausted)
-[RELAXED][SPREAD=10] Success (spread=5.00, proven minimum)
+[SPREAD=0] No arrangement possible (all options exhausted)
+[SPREAD=10] Success (spread=5.00, group overlaps=3, proven minimum)
 ```
 
 This indicates which spread level the solver is working on.

@@ -29,7 +29,14 @@ The system is designed for real-world use cases where strict constraints must be
 ```
 .
 ├── balancer/
-│   └── team_balancer.py
+│   └── team_balancer.py      # balance_teams: group overlaps, then spread tiers
+│   └── cpsat_solver.py       # OR-Tools CP-SAT model and searches
+│   └── constraints.py        # family / group rules and per-team group caps
+│   └── friend_blocks.py      # friend groups that must share a team
+│   └── team_layouts.py       # allowed team-size layouts
+│   └── scoring.py            # spread and group-overlap scoring
+│   └── heuristic_search.py   # greedy fallback search
+│   └── logging_config.py     # console + file logging
 ├── data/
 │   └── players.csv
 │   └── teams.json
@@ -39,6 +46,7 @@ The system is designed for real-world use cases where strict constraints must be
 │   └── csv_handler.py
 │   └── json_handler.py
 ├── main.py
+├── requirements.txt
 └── README.md
 ```
 

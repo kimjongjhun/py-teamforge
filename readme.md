@@ -15,7 +15,7 @@ The system is designed for real-world use cases where strict constraints must be
 - Keeps friend groups together, splitting only when necessary.
 - Ensures family members are never placed on the same team.
 - Distributes church groups across teams (groups must be split).
-- Searches for the most balanced result by checking spreads from 0 → 50 in increments of 10.
+- Searches for the most balanced result by checking spreads from 0 → 50 in increments of 10. Each tier is searched exhaustively (OR-Tools CP-SAT) and proven impossible before the next tier is tried, and the lowest spread within the first feasible tier is returned.
 - Produces a clean JSON output with:
   - Final spread used
   - All team rosters
@@ -53,7 +53,7 @@ git clone <your-repo-url>
 cd py-Teamforge
 ```
 
-Install dependencies (if any):
+Install dependencies (OR-Tools):
 
 ```
 pip install -r requirements.txt
@@ -102,8 +102,8 @@ The system will:
 
 1. Load players from the CSV.
 2. Attempt valid team layouts.
-3. Test spreads: 0, 10, 20, 30, 40, 50.
-4. Stop at the first spread that yields valid teams.
+3. Test spreads: 0, 10, 20, 30, 40, 50, exhausting every arrangement in a tier before moving to the next.
+4. Stop at the first spread that yields valid teams, returning the lowest spread found in it.
 5. Output results to `data/teams.json`.
 
 ---
@@ -193,9 +193,9 @@ If a perfect spread is impossible, the solver gradually relaxes constraints.
 During execution, you will see:
 
 ```
-Trying spread: 0
-Trying spread: 10
-Trying spread: 20
+[STRICT][SPREAD=0] No arrangement possible (all options exhausted)
+[RELAXED][SPREAD=0] No arrangement possible (all options exhausted)
+[RELAXED][SPREAD=10] Success (spread=5.00, proven minimum)
 ```
 
 This indicates which spread level the solver is working on.

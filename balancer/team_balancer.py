@@ -5,7 +5,8 @@ import os
 import heapq
 import logging
 from collections import defaultdict
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
+from ortools.sat.python import cp_model
 from models.player import Player
 
 # ---------------------------
@@ -360,11 +361,107 @@ def optimize_balance_with_timeout(teams: List[List[Player]], timeout_seconds: fl
 
 
 # ---------------------------
-# Master: progressive relaxation with strict -> relaxed fallback and detailed logging
+# Exact search: CP-SAT model that minimizes spread under the same constraints
+# (friend blocks together, family separation, per-team group limit, exact layout sizes).
+# Averages are scaled to integers at 0.01 precision.
 # ---------------------------
-def balance_teams(players: List[Player], max_search_spread: int = 50) -> Dict:
+SPREAD_SCALE = 100
+
+
+def solve_min_spread(
+    players: List[Player],
+    sizes: List[int],
+    max_group_per_team: int = 1,
+    spread_limit: Optional[float] = None,
+    timeout_seconds: float = 10.0,
+) -> Tuple[List[List[Player]], float, bool]:
+    """
+    Find the minimum-spread assignment for a layout, optionally restricted to spread <= spread_limit.
+
+    Returns (teams, spread, proven):
+        teams  -- best assignment found ([] if none)
+        spread -- evaluate_spread(teams), or math.inf if none
+        proven -- True if the search was exhausted (teams is optimal, or no assignment exists)
+    """
+    k = len(sizes)
+    blocks = build_blocks(players, max(sizes))
+    if any(len(b) > max(sizes) for b in blocks):
+        return [], math.inf, True
+
+    model = cp_model.CpModel()
+    x = [[model.NewBoolVar(f"b{b}_t{t}") for t in range(k)] for b in range(len(blocks))]
+
+    for b in range(len(blocks)):
+        model.AddExactlyOne(x[b])
+    for t in range(k):
+        model.Add(sum(len(blocks[b]) * x[b][t] for b in range(len(blocks))) == sizes[t])
+
+    # Family limit is per block (as in violates_family); group limit counts every player.
+    family_blocks: Dict[str, set] = defaultdict(set)
+    group_blocks: Dict[str, List[int]] = defaultdict(list)
+    for b, block in enumerate(blocks):
+        for p in block:
+            if p.family_code:
+                family_blocks[p.family_code].add(b)
+            if p.group_code:
+                group_blocks[p.group_code].append(b)
+    for t in range(k):
+        for bs in family_blocks.values():
+            model.Add(sum(x[b][t] for b in bs) <= 1)
+        for bs in group_blocks.values():
+            model.Add(sum(x[b][t] for b in bs) <= max_group_per_team)
+
+    block_scores = [round(sum(p.average for p in block) * SPREAD_SCALE) for block in blocks]
+    max_total = sum(abs(v) for v in block_scores)
+    totals = []
+    for t in range(k):
+        total = model.NewIntVar(-max_total, max_total, f"total{t}")
+        model.Add(total == sum(block_scores[b] * x[b][t] for b in range(len(blocks))))
+        totals.append(total)
+
+    # Teams of equal size are interchangeable; order them to skip mirrored solutions.
+    for t in range(k - 1):
+        if sizes[t] == sizes[t + 1]:
+            model.Add(totals[t] <= totals[t + 1])
+
+    hi = model.NewIntVar(-max_total, max_total, "hi")
+    lo = model.NewIntVar(-max_total, max_total, "lo")
+    model.AddMaxEquality(hi, totals)
+    model.AddMinEquality(lo, totals)
+    if spread_limit is not None:
+        model.Add(hi - lo <= round(spread_limit * SPREAD_SCALE))
+    model.Minimize(hi - lo)
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = timeout_seconds
+    solver.parameters.num_workers = 1
+    status = solver.Solve(model)
+    proven = status in (cp_model.OPTIMAL, cp_model.INFEASIBLE)
+    logger.debug(
+        "CP-SAT layout=%s max_group=%d limit=%s -> %s (%.2fs)",
+        sizes, max_group_per_team, spread_limit, solver.StatusName(status), solver.WallTime(),
+    )
+
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return [], math.inf, proven
+
+    teams = [
+        [p for b in range(len(blocks)) if solver.Value(x[b][t]) for p in blocks[b]]
+        for t in range(k)
+    ]
+    return teams, evaluate_spread(teams), proven
+
+
+# ---------------------------
+# Master: spread tiers (lowest first, each exhausted before the next), strict -> relaxed
+# ---------------------------
+def balance_teams(players: List[Player], max_search_spread: int = 50, solver_timeout_seconds: float = 10.0) -> Dict:
     """
     Attempts to create the most balanced teams possible.
+
+    For each mode (STRICT, then RELAXED) and each spread tier (0, 10, ..., max_search_spread),
+    every layout is searched exhaustively for the lowest spread within the tier. A higher tier is
+    only tried once the lower tier is proven impossible.
 
     Returns:
         {
@@ -379,56 +476,52 @@ def balance_teams(players: List[Player], max_search_spread: int = 50) -> Dict:
         logger.error("No valid team-size layouts for %d players.", n)
         return {"spread_used": None, "teams": [], "group_mode": "NONE"}
 
-    spread_tiers = list(range(0, max_search_spread + 1, 10))
-
-    # Phase order: strict first (max 1 per group), then relaxed (max 2 per group)
     for mode, max_group_per_team in [("STRICT", 1), ("RELAXED", 2)]:
         logger.info("=== Starting mode: %s (max_group_per_team=%d) ===", mode, max_group_per_team)
-        best_teams = None
-        best_spread = math.inf
+        for spread_limit in range(0, max_search_spread + 1, 10):
+            best_teams = None
+            best_spread = math.inf
+            exhausted = True
 
-        for layout in layouts:
-            logger.debug("[%s] Trying layout sizes %s", mode, layout)
-            assigned = try_assign_with_timeout(
-                players, layout, max_group_per_team=max_group_per_team, timeout_seconds=10.0
-            )
-            if not assigned:
-                logger.debug("[%s] Assignment failed or timed out for layout %s", mode, layout)
-                continue
+            for layout in layouts:
+                teams, spread, proven = solve_min_spread(
+                    players, layout, max_group_per_team, spread_limit, solver_timeout_seconds
+                )
+                exhausted = exhausted and proven
+                logger.debug("[%s][SPREAD=%d] Layout %s -> spread=%.2f (proven=%s)", mode, spread_limit, layout, spread, proven)
+                if teams and spread < best_spread:
+                    best_spread = spread
+                    best_teams = teams
 
-            optimized = optimize_balance_with_timeout(assigned, timeout_seconds=10.0)
-            spread = evaluate_spread(optimized)
-            logger.debug("[%s] Layout %s produced spread=%.2f after optimization", mode, layout, spread)
+            if best_teams is not None:
+                if exhausted:
+                    logger.info("[%s][SPREAD=%d] Success (spread=%.2f, proven minimum)", mode, spread_limit, best_spread)
+                else:
+                    logger.warning("[%s][SPREAD=%d] Success (spread=%.2f, solver timed out before proving minimum)", mode, spread_limit, best_spread)
+                return {"spread_used": best_spread, "teams": best_teams, "group_mode": mode}
 
-            if spread < best_spread:
-                best_spread = spread
-                best_teams = optimized
+            if exhausted:
+                logger.info("[%s][SPREAD=%d] No arrangement possible (all options exhausted)", mode, spread_limit)
+            else:
+                logger.warning("[%s][SPREAD=%d] Solver timed out before exhausting this tier; moving on", mode, spread_limit)
 
-        spread_limit = next((s for s in spread_tiers if s >= best_spread), None)
-        if spread_limit is not None:
-            logger.info("[%s][SPREAD=%d] Success (spread=%.2f)", mode, spread_limit, best_spread)
-            return {"spread_used": best_spread, "teams": best_teams, "group_mode": mode}
+        logger.info("[%s] No arrangement within spread=%d. Switching mode if available.", mode, max_search_spread)
 
-        logger.info(
-            "[%s] No layout within spread=%d. Best spread seen=%.2f. Switching mode if available.",
-            mode,
-            max_search_spread,
-            best_spread,
-        )
-
-    # Final best-effort pass: pick the best spread we could find under time-limited attempts
-    logger.info("Attempting final best-effort search (time-limited) across layouts.")
+    # Best-effort: lowest spread with no limit (relaxed), heuristic if the solver finds nothing in time
+    logger.info("Attempting final best-effort search across layouts.")
     best_overall = None
     best_overall_spread = math.inf
     for layout in layouts:
-        assigned = try_assign_with_timeout(players, layout, max_group_per_team=2, timeout_seconds=5.0)
-        if not assigned:
-            continue
-        optimized = optimize_balance_with_timeout(assigned, timeout_seconds=5.0)
-        spread = evaluate_spread(optimized)
+        teams, spread, _ = solve_min_spread(players, layout, 2, None, solver_timeout_seconds)
+        if not teams:
+            assigned = try_assign_with_timeout(players, layout, max_group_per_team=2, timeout_seconds=5.0)
+            if not assigned:
+                continue
+            teams = optimize_balance_with_timeout(assigned, timeout_seconds=5.0)
+            spread = evaluate_spread(teams)
         if spread < best_overall_spread:
             best_overall_spread = spread
-            best_overall = optimized
+            best_overall = teams
 
     if best_overall is not None:
         logger.warning("No arrangement met strict/relaxed limits; returning best-effort with spread=%.2f", best_overall_spread)

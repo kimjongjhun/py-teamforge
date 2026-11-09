@@ -14,8 +14,8 @@ The system is designed for real-world use cases where strict constraints must be
   - Up to two teams of **3** with the rest **4**
 - Keeps friend groups together, splitting only when necessary.
 - Ensures family members are never placed on the same team.
-- Distributes church groups across teams, but never at the cost of a higher spread: among arrangements with the lowest spread, the one with the fewest same-group teammates is chosen.
-- Searches for the most balanced result by checking spreads from 0 → 50 in increments of 10. Each tier is searched exhaustively (OR-Tools CP-SAT) and proven impossible before the next tier is tried, and the lowest spread within the first feasible tier is returned (fewest group overlaps as the tiebreaker).
+- Distributes church groups across teams: at most ceil(group size / teams) players of a group per team (e.g. 11 young adults on 9 teams -> two teams get 2, never one team with 3), and only as many same-group teammates as the other constraints make unavoidable.
+- Searches for the most balanced result by checking spreads from 0 → 50 in increments of 10. Each tier is searched exhaustively (OR-Tools CP-SAT) and proven impossible before the next tier is tried, and the lowest spread within the first feasible tier is returned.
 - Produces a clean JSON output with:
   - Final spread used
   - All team rosters
@@ -180,11 +180,11 @@ The system will:
 
 - Friend groups stay together if possible.
 - Family members are split into separate teams.
-- Church groups are distributed to minimize same-group teammates, as a tiebreaker after spread.
+- Church groups share a team only when mathematically required (see Features).
 - Team sizes respect allowed patterns.
 - Average sums must fall within the allowed spread.
 
-Team sizes, friend groups and family separation are hard constraints; church-group separation is a soft preference.
+Team sizes, friend groups, family separation and the church-group limits are hard constraints; spread is minimized within them.
 
 ---
 
